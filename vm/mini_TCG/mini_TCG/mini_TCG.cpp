@@ -7,6 +7,10 @@
 #include <limits>
 #include <string>
 
+#include <chrono>
+#include <numeric>
+#include <iomanip>
+
 class MiniTCGVM {
 public:
     using i32 = std::int32_t;
@@ -221,45 +225,58 @@ private:
     std::size_t max_tb_insns_;
 };
 
-
-//First run :
-//
-//[TB MISS] ¡ú translate(switch occurs) ¡ú cache TB ¡ú execute TB
-//
-//Second run :
-//
-//[TB HIT] ¡ú directly execute TB(no decoding switch) ¡ú more like "directly jumping to host code"
-//
-//After patch() :
-//
-//    version changes ¡ú cache invalidates ¡ú back to miss / translate(simulating self - modified code / code page write causing invalidate)
+template <class F>
+static long long time_us(F&& f, int rounds = 1) {
+    using namespace std::chrono;
+    auto t0 = steady_clock::now();
+    for (int i = 0; i < rounds; ++i) f();
+    auto t1 = steady_clock::now();
+    return duration_cast<microseconds>(t1 - t0).count();
+}
 // ---- demo ----
 int main() {
     MiniTCGVM vm(/*max_tb_insns=*/8);
 
-    // program: push 3; push 4; add; print; halt
-    std::vector<MiniTCGVM::i32> prog = {
-        MiniTCGVM::enc_pos_imm(3),
-        MiniTCGVM::enc_pos_imm(4),
-        MiniTCGVM::enc_prim(MiniTCGVM::Prim::Add),
-        MiniTCGVM::enc_prim(MiniTCGVM::Prim::Print),
-        MiniTCGVM::enc_prim(MiniTCGVM::Prim::Halt),
-    };
+   
+    std::vector<MiniTCGVM::i32> prog;
+    const int N = 20000; //
+    for (int i = 0; i < N; ++i) {
+        prog.push_back(MiniTCGVM::enc_pos_imm(i));
+        prog.push_back(MiniTCGVM::enc_pos_imm(i + 1));
+        prog.push_back(MiniTCGVM::enc_prim(MiniTCGVM::Prim::Add));
+    }
+    prog.push_back(MiniTCGVM::enc_prim(MiniTCGVM::Prim::Print));
+    prog.push_back(MiniTCGVM::enc_prim(MiniTCGVM::Prim::Halt));
 
     vm.loadProgram(prog);
+   
+    auto cold = [&]() {
+        vm.loadProgram(prog);
+        vm.run(false);
+        };
 
-    std::cout << "=== First run (expect TB misses) ===\n";
-    vm.run(true);
+    auto hot = [&]() {
+        vm.run(false);
+        };
 
-    std::cout << "\n=== Second run (expect TB hits) ===\n";
-    vm.run(true);
+    vm.loadProgram(prog);
+    vm.run(false);
 
-    std::cout << "\n=== Patch program (invalidate TB cache) ===\n";
-    // patch: change push 4 -> push 10
-    vm.patch(1, MiniTCGVM::enc_pos_imm(10));
+    const int cold_rounds = 5;  //
+    const int hot_rounds = 30;  
 
-    std::cout << "=== Third run after patch (miss again) ===\n";
-    vm.run(true);
+    long long cold_us = time_us(cold, cold_rounds);
+    vm.loadProgram(prog);
+    vm.run(false); // cache
+    long long hot_us = time_us(hot, hot_rounds);
 
-    return 0;
+    double cold_avg = double(cold_us) / cold_rounds;
+    double hot_avg = double(hot_us) / hot_rounds;
+    double speedup = cold_avg / hot_avg;
+
+    std::cout << std::fixed << std::setprecision(2);
+    std::cout << "Program insns ~ " << prog.size() << "\n";
+    std::cout << "Cold avg: " << cold_avg << " us/run (miss+translate)\n";
+    std::cout << "Hot  avg: " << hot_avg << " us/run (hit+exec)\n";
+    std::cout << "Speedup:  " << speedup << "x (cold/hot)\n";
 }
